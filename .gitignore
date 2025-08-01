@@ -1,0 +1,15 @@
+# Ignorer environnement virtuel
+venv/
+
+# Fichiers Python temporaires
+__pycache__/
+*.pyc
+
+# Fichiers de configuration secrets
+.env
+.env.*
+
+# Fichiers inutiles
+*.log
+*.zip
+.DS_Store
