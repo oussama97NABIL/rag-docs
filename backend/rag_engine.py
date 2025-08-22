@@ -6,11 +6,7 @@ RAG Engine (SentenceTransformers + FAISS + Ollama)
 - Embeddings (all-MiniLM-L6-v2)
 - Index FAISS (L2)
 - Génération via Ollama (LLM local, HTTP)
-
-Usage minimal :
-    engine = RAGEngine(data_dir="...")  # par défaut: ../data/raw_documents
-    engine.initialize()
-    answer, sources = engine.answer_question("What are ABSs?", top_k=3)
+- Réponse déterministe pour "combien de fichiers" basée sur les fichiers réels
 """
 
 from __future__ import annotations
@@ -18,7 +14,6 @@ from __future__ import annotations
 import os
 import re
 import glob
-import json
 import logging
 from typing import List, Tuple, Dict, Optional
 
@@ -49,26 +44,18 @@ except ImportError:
     docx = None
 
 
+# --------- utilitaires texte ----------
 def _normalize_text(s: str) -> str:
-    """Nettoyage : ligatures, césures, retours lignes, espaces."""
-    # soft hyphen
-    s = s.replace("\u00ad", "")
-    # quelques ligatures communes
+    s = s.replace("\u00ad", "")  # soft hyphen
     s = (s.replace("\ufb00", "ff").replace("\ufb01", "fi")
            .replace("\ufb02", "fl").replace("\ufb03", "ffi").replace("\ufb04", "ffl"))
-    # inter-\nnet -> internet
-    s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)
-    # sauts de ligne -> espace
-    s = re.sub(r"[ \t]*\n+[ \t]*", " ", s)
-    # espaces multiples
+    s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)           # inter-\nnet -> internet
+    s = re.sub(r"[ \t]*\n+[ \t]*", " ", s)                 # \n -> espace
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
 def _truncate_chars(s: str, max_chars: int) -> str:
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + "..."
+    return s if len(s) <= max_chars else s[:max_chars] + "..."
 
 
 class RAGEngine:
@@ -81,12 +68,11 @@ class RAGEngine:
         chunk_overlap: int = 50,
         embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         ollama_url: str = "http://127.0.0.1:11434",
-        # Choisis un modèle que tu as pull: ex. "llama3" ou "llama3.1:8b-instruct" ou "qwen2.5:3b-instruct"
-        ollama_model: str = "llama3",
+        ollama_model: str = "llama3",      # ex. "llama3.1:8b-instruct", "qwen2.5:3b-instruct"
         max_new_tokens: int = 256,
         temperature: float = 0.2,
         timeout_sec: int = 120,
-        max_ctx_chars: int = 8000,  # limite du contexte envoyé au LLM (évite la lenteur)
+        max_ctx_chars: int = 8000,
     ):
         # data_dir par défaut: ../data/raw_documents (relatif à ce fichier)
         if data_dir is None:
@@ -113,6 +99,10 @@ class RAGEngine:
         self.chunks: List[str] = []
         self.chunk_sources: List[Dict[str, str]] = []
 
+        # NEW: suivi des fichiers réels
+        self.source_files_set: set[str] = set()
+        self.source_files: List[str] = []
+
         logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
         self.logger = logging.getLogger("rag_engine")
 
@@ -138,26 +128,38 @@ class RAGEngine:
         if self.index is None or self.embedding_model is None:
             raise RuntimeError("The engine has not been initialized. Call initialize() first.")
 
-        # Encode query
+        # INTENT: "combien de fichiers" / "how many files"
+        qlow = question.strip().lower()
+        if any(kw in qlow for kw in [
+            "combien de fichiers", "nombre de fichiers", "how many files", "how many documents", "nombre de documents"
+        ]):
+            n, files = self.get_file_stats()
+            lignes = [f"Il y a {n} fichier{'s' if n != 1 else ''} :"]
+            for i, f in enumerate(files, 1):
+                lignes.append(f"{i}. {f}")
+            return "\n".join(lignes), [{"document": f, "snippet": ""} for f in files]
+
+        # Retrieval classique
         q = self.embedding_model.encode([question], convert_to_numpy=True).astype(np.float32)
         D, I = self.index.search(q, top_k)
 
-        # Collect retrieved chunks + meta
         retrieved_chunks, retrieved_meta = [], []
         for idx in I[0]:
             if 0 <= idx < len(self.chunks):
                 retrieved_chunks.append(self.chunks[idx])
                 retrieved_meta.append(self.chunk_sources[idx])
 
-        # Generate answer with Ollama
         answer = self._generate_with_ollama(question, retrieved_chunks)
 
-        # Prepare sources
         sources: List[Dict[str, str]] = []
         for m in retrieved_meta:
             snip = m["content"].strip().replace("\n", " ")
             sources.append({"document": m["document"], "snippet": _truncate_chars(snip, 300)})
         return answer, sources
+
+    # ---------------- Files stats ----------------
+    def get_file_stats(self) -> tuple[int, List[str]]:
+        return len(self.source_files), list(self.source_files)
 
     # ---------------- Document loading ----------------
     def _load_documents(self, directory: str) -> List[Tuple[str, str]]:
@@ -178,7 +180,12 @@ class RAGEngine:
                 continue
             text = _normalize_text(text)
             if text:
-                docs.append((os.path.basename(file_path), text))
+                fname = os.path.basename(file_path)
+                docs.append((fname, text))
+                # NEW: mémoriser le vrai fichier
+                self.source_files_set.add(fname)
+        # NEW: liste finale ordonnée (stable)
+        self.source_files = sorted(self.source_files_set)
         return docs
 
     def _read_pdf(self, path: str) -> str:
@@ -235,7 +242,6 @@ class RAGEngine:
 
     # ---------------- Generation: Ollama ----------------
     def _generate_with_ollama(self, question: str, context_chunks: List[str]) -> str:
-        # Troncature du contexte pour éviter les prompts géants
         context = _truncate_chars("\n\n".join(context_chunks), self.max_ctx_chars)
 
         system_prompt = (
@@ -245,7 +251,6 @@ class RAGEngine:
         )
         user_prompt = f"CONTEXTE:\n{context}\n\nQUESTION:\n{question}"
 
-        # Utilise l'endpoint /api/chat (plus propre pour rôles system/user)
         try:
             url = f"{self.ollama_url}/api/chat"
             payload = {
@@ -258,15 +263,13 @@ class RAGEngine:
                     "temperature": self.temperature,
                     "num_predict": self.max_new_tokens,
                 },
-                "stream": False,  # réponse non-streamée pour simplifier
+                "stream": False,
             }
             r = requests.post(url, json=payload, timeout=self.timeout_sec)
             r.raise_for_status()
             data = r.json()
-            # Format attendu: {"message": {"role": "...", "content": "..."}}
             if isinstance(data, dict) and "message" in data and "content" in data["message"]:
                 return (data["message"]["content"] or "").strip()
-            # Si jamais c'est une liste de chunks (rare ici, stream=False), on concatène
             if isinstance(data, list):
                 text = "".join(ch.get("message", {}).get("content", "") for ch in data)
                 out = text.strip()
