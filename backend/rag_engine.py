@@ -1,157 +1,167 @@
 """
-Core logic for the retrieval‑augmented generation (RAG) system.
+RAG Engine (SentenceTransformers + FAISS + Ollama)
 
-This module implements the end‑to‑end pipeline for loading and
-preprocessing documents, creating embeddings, storing them in a
-similarity index, and serving answers to user queries.  The engine
-supports PDFs, Word documents and plain text files.  It uses
-SentenceTransformers to compute dense vector embeddings and FAISS to
-perform fast nearest‑neighbour search.  For the generation step the
-engine will call an OpenAI ChatCompletion endpoint if an API key is
-provided; otherwise it falls back to a simple heuristic answer using
-retrieved text.
+- Charge des PDF/DOCX/TXT depuis data_dir
+- Nettoie & découpe en chunks chevauchés
+- Embeddings (all-MiniLM-L6-v2)
+- Index FAISS (L2)
+- Génération via Ollama (LLM local, HTTP)
+
+Usage minimal :
+    engine = RAGEngine(data_dir="...")  # par défaut: ../data/raw_documents
+    engine.initialize()
+    answer, sources = engine.answer_question("What are ABSs?", top_k=3)
 """
 
 from __future__ import annotations
 
 import os
+import re
 import glob
+import json
 import logging
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
+import requests
 
+# ---- FAISS ----
 try:
     import faiss  # type: ignore
 except ImportError as e:
-    raise RuntimeError(
-        "faiss is required for vector search. Please install 'faiss-cpu' via pip."
-    ) from e
+    raise RuntimeError("faiss is required. Install 'faiss-cpu' via pip.") from e
 
+# ---- Sentence Transformers ----
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
 except ImportError as e:
-    raise RuntimeError(
-        "sentence-transformers is required for embedding. Please install it via pip."
-    ) from e
+    raise RuntimeError("sentence-transformers is required. Install via pip.") from e
 
-# Optional dependencies
-try:
-    import openai  # type: ignore
-except Exception:
-    openai = None  # fallback if OpenAI is not installed
-
+# ---- PDF / DOCX (optionnels) ----
 try:
     import PyPDF2  # type: ignore
 except ImportError:
-    PyPDF2 = None  # optional, used for PDF parsing
+    PyPDF2 = None
 
 try:
     import docx  # type: ignore
 except ImportError:
-    docx = None  # optional, used for DOCX parsing
+    docx = None
+
+
+def _normalize_text(s: str) -> str:
+    """Nettoyage : ligatures, césures, retours lignes, espaces."""
+    # soft hyphen
+    s = s.replace("\u00ad", "")
+    # quelques ligatures communes
+    s = (s.replace("\ufb00", "ff").replace("\ufb01", "fi")
+           .replace("\ufb02", "fl").replace("\ufb03", "ffi").replace("\ufb04", "ffl"))
+    # inter-\nnet -> internet
+    s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)
+    # sauts de ligne -> espace
+    s = re.sub(r"[ \t]*\n+[ \t]*", " ", s)
+    # espaces multiples
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _truncate_chars(s: str, max_chars: int) -> str:
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "..."
 
 
 class RAGEngine:
-    """The engine orchestrates document processing, retrieval and generation.
+    """Orchestrates document processing, retrieval and local generation (Ollama)."""
 
-    Typical usage:
-
-    ```python
-    engine = RAGEngine(data_dir="data/raw_documents")
-    engine.initialize()
-    answer, sources = engine.answer_question("What is FAISS?")
-    ```
-    """
-
-    def __init__(self, data_dir: str | None = None, chunk_size: int = 500, chunk_overlap: int = 50):
-        # Determine corpus directory relative to project root if not provided
+    def __init__(
+        self,
+        data_dir: Optional[str] = None,
+        chunk_size: int = 500,
+        chunk_overlap: int = 50,
+        embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        ollama_url: str = "http://127.0.0.1:11434",
+        # Choisis un modèle que tu as pull: ex. "llama3" ou "llama3.1:8b-instruct" ou "qwen2.5:3b-instruct"
+        ollama_model: str = "llama3",
+        max_new_tokens: int = 256,
+        temperature: float = 0.2,
+        timeout_sec: int = 120,
+        max_ctx_chars: int = 8000,  # limite du contexte envoyé au LLM (évite la lenteur)
+    ):
+        # data_dir par défaut: ../data/raw_documents (relatif à ce fichier)
         if data_dir is None:
-            # Use the default data directory located at ../../data/raw_documents
             module_dir = os.path.dirname(os.path.abspath(__file__))
             data_dir = os.path.abspath(os.path.join(module_dir, "..", "data", "raw_documents"))
-        self.data_dir: str = data_dir
-        self.chunk_size: int = chunk_size
-        self.chunk_overlap: int = chunk_overlap
-        self.embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
-        self.embedding_model: SentenceTransformer | None = None
-        self.index: faiss.IndexFlatL2 | None = None
-        self.chunks: List[str] = []  # list of chunk strings
-        self.chunk_sources: List[Dict[str, str]] = []  # metadata for each chunk: {'document': filename, 'content': chunk_text}
-        # Logging configuration
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
 
+        self.data_dir = data_dir
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.embedding_model_name = embedding_model_name
+
+        # Ollama
+        self.ollama_url = ollama_url.rstrip("/")
+        self.ollama_model = ollama_model
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.timeout_sec = timeout_sec
+        self.max_ctx_chars = max_ctx_chars
+
+        # État
+        self.embedding_model: Optional[SentenceTransformer] = None
+        self.index: Optional[faiss.IndexFlatL2] = None
+        self.embeddings: Optional[np.ndarray] = None
+        self.chunks: List[str] = []
+        self.chunk_sources: List[Dict[str, str]] = []
+
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
+        self.logger = logging.getLogger("rag_engine")
+
+    # ---------------- Initialization ----------------
     def initialize(self) -> None:
-        """Load documents, build embeddings and construct the vector index.
-
-        Calling this method is an expensive operation.  It should be done
-        once when the application starts.  Subsequent calls will reuse
-        existing state.
-        """
-        # Only run initialization once
         if self.index is not None:
             return
         self.logger.info("Loading documents from %s", self.data_dir)
         documents = self._load_documents(self.data_dir)
         self.logger.info("Loaded %d documents", len(documents))
+
         self._create_chunks(documents)
         self.logger.info("Created %d chunks", len(self.chunks))
+
         self._embed_chunks()
-        self.logger.info("Created embeddings of shape %s", str(self.embeddings.shape))
+        self.logger.info("Created embeddings of shape %s", getattr(self.embeddings, "shape", None))
+
         self._build_index()
         self.logger.info("Built FAISS index with %d vectors", self.index.ntotal if self.index else 0)
 
+    # ---------------- Q&A ----------------
     def answer_question(self, question: str, top_k: int = 3) -> Tuple[str, List[Dict[str, str]]]:
-        """Answer a user question using retrieval‑augmented generation.
-
-        Parameters
-        ----------
-        question: The user query in natural language.
-        top_k: Number of top most similar chunks to retrieve.
-
-        Returns
-        -------
-        answer: Generated text answering the question.
-        sources: A list of dicts with keys ``document`` and ``snippet`` representing the
-                 supporting chunks used.
-        """
-        if self.index is None:
+        if self.index is None or self.embedding_model is None:
             raise RuntimeError("The engine has not been initialized. Call initialize() first.")
-        # Compute query embedding
-        query_embedding = self.embedding_model.encode([question])  # type: ignore
-        # Convert to float32 for FAISS
-        query_embedding = query_embedding.astype(np.float32)
-        # Perform search
-        distances, indices = self.index.search(query_embedding, top_k)  # type: ignore
-        retrieved_chunks: List[str] = []
-        retrieved_metadata: List[Dict[str, str]] = []
-        for idx in indices[0]:
-            retrieved_chunks.append(self.chunks[idx])
-            retrieved_metadata.append(self.chunk_sources[idx])
-        # Generate answer from retrieved context
-        answer = self._generate_answer(question, retrieved_chunks)
-        # Prepare sources with snippet limited to 200 characters for readability
+
+        # Encode query
+        q = self.embedding_model.encode([question], convert_to_numpy=True).astype(np.float32)
+        D, I = self.index.search(q, top_k)
+
+        # Collect retrieved chunks + meta
+        retrieved_chunks, retrieved_meta = [], []
+        for idx in I[0]:
+            if 0 <= idx < len(self.chunks):
+                retrieved_chunks.append(self.chunks[idx])
+                retrieved_meta.append(self.chunk_sources[idx])
+
+        # Generate answer with Ollama
+        answer = self._generate_with_ollama(question, retrieved_chunks)
+
+        # Prepare sources
         sources: List[Dict[str, str]] = []
-        for meta in retrieved_metadata:
-            snippet = meta["content"]
-            # Trim snippet for readability
-            snippet = snippet.strip().replace("\n", " ")
-            sources.append({"document": meta["document"], "snippet": snippet[:300] + ("..." if len(snippet) > 300 else "")})
+        for m in retrieved_meta:
+            snip = m["content"].strip().replace("\n", " ")
+            sources.append({"document": m["document"], "snippet": _truncate_chars(snip, 300)})
         return answer, sources
 
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
-
+    # ---------------- Document loading ----------------
     def _load_documents(self, directory: str) -> List[Tuple[str, str]]:
-        """Recursively load all documents from ``directory``.
-
-        Supported formats include PDF, DOCX and plain text.  Each returned
-        tuple contains the filename and the extracted text.  Files that
-        cannot be parsed are skipped with a warning.
-        """
-        documents: List[Tuple[str, str]] = []
+        docs: List[Tuple[str, str]] = []
         for file_path in glob.glob(os.path.join(directory, "**", "*"), recursive=True):
             if os.path.isdir(file_path):
                 continue
@@ -166,126 +176,107 @@ class RAGEngine:
             except Exception as exc:
                 self.logger.warning("Failed to parse %s: %s", file_path, exc)
                 continue
+            text = _normalize_text(text)
             if text:
-                documents.append((os.path.basename(file_path), text))
-        return documents
+                docs.append((os.path.basename(file_path), text))
+        return docs
 
     def _read_pdf(self, path: str) -> str:
-        """Extract text from a PDF file using PyPDF2.
-
-        Returns an empty string if PyPDF2 is unavailable or if no text is
-        extracted.
-        """
         if PyPDF2 is None:
             raise RuntimeError("PyPDF2 is not installed. Install it to parse PDFs.")
-        text_parts: List[str] = []
+        parts: List[str] = []
         with open(path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
                 try:
-                    text_parts.append(page.extract_text() or "")
+                    parts.append(page.extract_text() or "")
                 except Exception:
                     continue
-        return "\n".join(text_parts)
+        return "\n".join(parts)
 
     def _read_docx(self, path: str) -> str:
-        """Extract text from a DOCX file using python‑docx."""
         if docx is None:
-            raise RuntimeError("python-docx is not installed. Install it to parse Word documents.")
-        doc = docx.Document(path)  # type: ignore
-        paragraphs = [para.text for para in doc.paragraphs]
-        return "\n".join(paragraphs)
+            raise RuntimeError("python-docx is not installed.")
+        d = docx.Document(path)  # type: ignore
+        return "\n".join(p.text for p in d.paragraphs)
 
     def _read_text(self, path: str) -> str:
-        """Read plain text from file, attempting UTF‑8 and fallback encodings."""
         with open(path, "rb") as f:
             data = f.read()
-        for encoding in ("utf-8", "latin-1", "utf-16"):
+        for enc in ("utf-8", "latin-1", "utf-16"):
             try:
-                return data.decode(encoding)
+                return data.decode(enc)
             except Exception:
                 continue
         return ""
 
-    def _clean_text(self, text: str) -> str:
-        """Basic text cleaning: collapse multiple newlines and spaces."""
-        return " ".join(text.strip().split())
-
+    # ---------------- Chunking & Embeddings ----------------
     def _create_chunks(self, documents: List[Tuple[str, str]]) -> None:
-        """Split each document into overlapping chunks.
-
-        This method populates ``self.chunks`` and ``self.chunk_sources``.  Each
-        chunk contains between ``chunk_size`` and ``chunk_size`` tokens and
-        overlaps the previous chunk by ``chunk_overlap`` tokens.  Tokens are
-        defined as whitespace‑separated words.  Chunks preserve the order
-        of the original text.
-        """
         for filename, text in documents:
-            clean_text = self._clean_text(text)
-            words = clean_text.split()
+            words = " ".join(text.strip().split()).split()
             if not words:
                 continue
             step = max(1, self.chunk_size - self.chunk_overlap)
             for start in range(0, len(words), step):
-                end = start + self.chunk_size
-                chunk_words = words[start:end]
-                if not chunk_words:
-                    continue
-                chunk_text = " ".join(chunk_words)
-                self.chunks.append(chunk_text)
-                self.chunk_sources.append({"document": filename, "content": chunk_text})
+                chunk = " ".join(words[start:start + self.chunk_size])
+                if chunk:
+                    self.chunks.append(chunk)
+                    self.chunk_sources.append({"document": filename, "content": chunk})
 
     def _embed_chunks(self) -> None:
-        """Compute embeddings for all chunks using SentenceTransformers."""
         self.embedding_model = SentenceTransformer(self.embedding_model_name)
-        # Note: encoding large corpora may take a while; it's good practice to
-        # show a progress bar to the user (omitted here for brevity).
-        self.embeddings = self.embedding_model.encode(self.chunks, convert_to_numpy=True)
-        # Ensure float32 dtype for FAISS
-        self.embeddings = self.embeddings.astype(np.float32)
+        embs = self.embedding_model.encode(self.chunks, convert_to_numpy=True)
+        self.embeddings = embs.astype(np.float32)
 
     def _build_index(self) -> None:
-        """Create a FAISS index from the embeddings."""
-        dimension = self.embeddings.shape[1]
-        # Use a simple flat L2 index; for larger datasets consider HNSW or IVF
-        self.index = faiss.IndexFlatL2(dimension)
+        dim = int(self.embeddings.shape[1])
+        self.index = faiss.IndexFlatL2(dim)
         self.index.add(self.embeddings)
 
-    def _generate_answer(self, question: str, context_chunks: List[str]) -> str:
-        """Generate an answer given the question and retrieved context.
+    # ---------------- Generation: Ollama ----------------
+    def _generate_with_ollama(self, question: str, context_chunks: List[str]) -> str:
+        # Troncature du contexte pour éviter les prompts géants
+        context = _truncate_chars("\n\n".join(context_chunks), self.max_ctx_chars)
 
-        If an OpenAI API key is available in the environment and the
-        ``openai`` module is installed, this method calls the
-        ChatCompletion endpoint of GPT‑3.5 or GPT‑4.  Otherwise it
-        concatenates the retrieved context and returns it verbatim.
-        """
-        # Build context string
-        context = "\n\n".join(context_chunks)
-        api_key = os.getenv("OPENAI_API_KEY")
-        # If openai is available and an API key is provided, call the API
-        if openai is not None and api_key:
-            openai.api_key = api_key
-            system_prompt = (
-                "You are a helpful assistant. Answer the user's question as concisely as possible "
-                "using only the provided context. If the context does not contain the answer, "
-                "respond with 'Je ne sais pas.'"
-            )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{question}"},
-            ]
-            try:
-                response = openai.ChatCompletion.create(
-                    model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-                    messages=messages,
-                    temperature=0.2,
-                    max_tokens=512,
-                )
-                return response.choices[0].message["content"].strip()
-            except Exception as exc:
-                self.logger.warning("OpenAI API call failed: %s", exc)
-                # Fall back to simple concatenation
-        # Fallback: return the first context chunk to give the user something meaningful
+        system_prompt = (
+            "Tu es un assistant technique. Réponds en 1–3 phrases, "
+            "uniquement à partir du CONTEXTE fourni. "
+            "Si la réponse n'est pas dans le contexte, réponds exactement: 'Je ne sais pas.'"
+        )
+        user_prompt = f"CONTEXTE:\n{context}\n\nQUESTION:\n{question}"
+
+        # Utilise l'endpoint /api/chat (plus propre pour rôles system/user)
+        try:
+            url = f"{self.ollama_url}/api/chat"
+            payload = {
+                "model": self.ollama_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "options": {
+                    "temperature": self.temperature,
+                    "num_predict": self.max_new_tokens,
+                },
+                "stream": False,  # réponse non-streamée pour simplifier
+            }
+            r = requests.post(url, json=payload, timeout=self.timeout_sec)
+            r.raise_for_status()
+            data = r.json()
+            # Format attendu: {"message": {"role": "...", "content": "..."}}
+            if isinstance(data, dict) and "message" in data and "content" in data["message"]:
+                return (data["message"]["content"] or "").strip()
+            # Si jamais c'est une liste de chunks (rare ici, stream=False), on concatène
+            if isinstance(data, list):
+                text = "".join(ch.get("message", {}).get("content", "") for ch in data)
+                out = text.strip()
+                return out if out else "Je ne sais pas."
+        except Exception as e:
+            self.logger.warning("Ollama call failed: %s", e)
+
+        # Fallback sans LLM
         if context_chunks:
-            return context_chunks[0]
+            preview = context_chunks[0].replace("\n", " ").strip()
+            return ("Je ne sais pas (LLM local indisponible). Extrait pertinent : "
+                    + _truncate_chars(preview, 300))
         return "Je ne sais pas."

@@ -22,8 +22,8 @@ from flask import Flask, request, jsonify
 import os
 from pydantic import ValidationError
 
-from .models import AskRequest, AskResponse, Source
-from .rag_engine import RAGEngine
+from models import AskRequest, AskResponse, Source
+from rag_engine import RAGEngine
 
 
 # Create the Flask application

@@ -1,15 +1,28 @@
 # Ignorer environnement virtuel
+# Environnements virtuels
 venv/
-
-# Fichiers Python temporaires
-__pycache__/
-*.pyc
-
-# Fichiers de configuration secrets
 .env
 .env.*
 
-# Fichiers inutiles
+# Fichiers Python temporaires et caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers inutiles ou générés automatiquement
 *.log
 *.zip
+*.tar
+*.gz
+*.tmp
 .DS_Store
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Bibliothèques et dépendances (à réinstaller via requirements.txt)
+*.egg-info/
+.eggs/
+dist/
+build/
